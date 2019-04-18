@@ -1,0 +1,60 @@
+let starttime1 = ago(7d);
+let starttime = starttime1-1h;
+let data = CustomerIntelligence  
+    | where Feature == "ContinuousDeploymentConfigurationCompleted"
+    | where PreciseTimeStamp > starttime1
+    | extend Props = parsejson(Properties)
+    | extend ciProps = parsejson(Props.properties)
+    | extend UserAgent = tostring(ciProps.UserAgent)
+    | extend Source = iff(UserAgent contains "VSServices" or UserAgent == "", "DevOps", iff(UserAgent contains "DevOpsExtension", "VSIDE", "IbizaCD"))
+    | extend CurrentStep = tostring(ciProps.CurrentStep)
+    | extend PipelineTemplateId = tostring(ciProps.PipelineTemplateId)
+    | where Source == "DevOps"  and CurrentStep == "Completed"
+    | extend ProjectId= tostring(ciProps.ProjectId)
+    | extend BuildId = tostring(ciProps.TriggeredBuildId)
+    | extend BuildDefinitionId = tostring(ciProps.BuildDefinitionId)
+    | extend ReleaseDefinitionId = tostring(ciProps.ReleaseDefinitionId)     
+    | extend BuildPlanGroup = strcat("Build:", ProjectId, ":", BuildId)
+    | extend ReleasePlanGroup = strcat("Release:", ProjectId, ":1")
+    | extend UniqueId = strcat(HostId, "_", ProjectId)
+    | where PipelineTemplateId == "ms.vss-continuous-delivery-pipeline-templates.javaspring-webapponcontainers"
+    | project PreciseTimeStamp, PipelineTemplateId, HostId , ProjectId , BuildDefinitionId , BuildId , ReleaseDefinitionId, BuildPlanGroup, ReleasePlanGroup, UniqueId
+    ;    
+let dataWithTaskStatus = data | join kind= leftouter (CustomerIntelligence | where Feature == "SendJob_TaskInstance" | where PreciseTimeStamp > starttime| project HostId, Properties) on HostId
+        | extend Props = parse_json(Properties)
+        | extend BuildPlanGroup2 = strcat("Build:", tostring(Props.properties.BuildIdentifier))
+        | extend ReleasePlanGroup2 = strcat("Release:", tostring(Props.properties.ReleaseIdentifier))
+        | where BuildPlanGroup == BuildPlanGroup2 or ReleasePlanGroup == ReleasePlanGroup2
+        | extend JobPlanId2 = strcat(tostring(Props.properties.PlanId), tostring(Props.properties.JobId))
+        | extend TaskName =tostring(Props.properties.Name)
+        | extend TaskInstanceId =tostring(Props.properties.TaskInstanceId)
+        | extend PlanGroup = iff(BuildPlanGroup2 == "Build:", ReleasePlanGroup2 , BuildPlanGroup2) 
+        | project HostId, PlanGroup, JobPlanId2, TaskName, TaskInstanceId, PipelineTemplateId
+    | join kind= leftouter (CustomerIntelligence | where Feature == "JobCompleted_TimelineInstance" | where PreciseTimeStamp > starttime| project HostId, Properties) on HostId
+        | extend Props = parse_json(Properties)
+        | extend TimelineResult =tostring(Props.properties.TimelineResult) | where TimelineResult == 2
+        | extend JobPlanId = strcat(tostring(Props.properties.PlanId), tostring(Props.properties.JobId))
+        | extend TimelineRecordId =tostring(Props.properties.TimelineRecordId)
+        | where JobPlanId == JobPlanId2 and TimelineRecordId  == TaskInstanceId
+        | project HostId, PlanGroup, TaskName, JobPlanId, PipelineTemplateId, TimelineResult
+| join kind= leftouter  (ClientTrace | where   PreciseTimeStamp > starttime | where   Feature == "JobCompleted_TimelineInstanceIssues" | project PreciseTimeStamp, HostId, Properties) on HostId
+        | parse   kind = simple Properties with *
+                                           '"JobId":"'            JobId:string            '"' *
+                                           '"TimelineResult":'    TimelineResult:int          *
+                                           '"PlanId":"'           PlanId:string           '"' *
+        | where   TimelineResult == 2
+        | extend JobPlanId2 = strcat(tostring(PlanId), tostring(JobId))
+        | where JobPlanId == JobPlanId2
+        | extend TaskError = extractjson("$.Errors", Properties)
+        | project Time1 = PreciseTimeStamp, HostId, PlanGroup, JobPlanId, TaskName, TaskError //= Properties 
+;
+let dataWithBuildAndReleaseStatus = data     
+    | join kind=leftouter (dataWithTaskStatus ) on HostId, $left.BuildPlanGroup  == $right .PlanGroup
+        | extend BuildResult = iff(TaskName == "", 1, 0)        
+        | project PreciseTimeStamp, PipelineTemplateId, HostId , ProjectId , BuildDefinitionId , BuildId , ReleaseDefinitionId, BuildResult, FailedBuildTaskName = TaskName, BuildError = TaskError, ReleasePlanGroup, UniqueId
+    | join kind=leftouter (dataWithTaskStatus ) on HostId, $left.ReleasePlanGroup   == $right.PlanGroup
+        | extend ReleaseResult = iff(TaskName == "", 1, 0)
+        | project PreciseTimeStamp, PipelineTemplateId, HostId , ProjectId , BuildDefinitionId , BuildId , ReleaseDefinitionId, ReleaseId = 1, BuildResult, ReleaseResult, BuildError, ReleaseError = TaskError, FailedBuildTaskName, FailedReleaseTaskName = TaskName, UniqueId
+   ;
+dataWithBuildAndReleaseStatus  | where BuildResult  == 0 or ReleaseResult == 0 
+| where PipelineTemplateId !contains "byoc"
